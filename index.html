@@ -1,0 +1,1539 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Bubble Bazaar</title>
+
+  <!-- React CDN -->
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+
+  <!-- Tone.js CDN -->
+  <script src="https://unpkg.com/tone/build/Tone.js"></script>
+
+  <!-- Babel for JSX in browser -->
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <style>
+    html,body,#root {
+      margin:0;
+      padding:0;
+      height:100%;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel">
+
+import { useState, useEffect, useRef, useCallback } from "react";
+import * as Tone from "tone";
+
+// ── Constants ─────────────────────────────────────────────────────────────────
+const COLORS = ["blue","yellow","pink","green","purple"];
+const KINDS  = ["star","moon","cloud","drop","flame"];
+const COLOR_LABELS = { blue:"蒼", yellow:"琥珀", pink:"珊瑚", green:"翡翠", purple:"菫" };
+const KIND_LABELS  = { star:"星屑", moon:"月影", cloud:"雲霞", drop:"雫", flame:"灯火" };
+const COLOR_HEX    = { blue:"#4e8fd9", yellow:"#d4a020", pink:"#d95b7b", green:"#35a970", purple:"#8855cc" };
+const COLOR_HEX_L  = { blue:"#ddeeff", yellow:"#fef6dc", pink:"#fde8ef", green:"#d6f5e6", purple:"#ede0f8" };
+const PL_C   = ["#4a8fe7","#e25b6a","#35a970","#d4a020"];
+const PL_BG  = ["#e8f1fd","#fde6e9","#d9f5e9","#fdf4e0"];
+const PL_AC  = ["#1a5fbf","#b02040","#1a7a4c","#9a6000"];
+
+const MAX_ROUNDS   = 8;
+const CARDS_PER_ROUND = 3;
+const START_COINS  = 20;
+const MAX_BID      = 5;
+const DECK_SIZE    = 30;
+// Each color/kind appears 6 times in the deck (25 base + 5 extras, spread evenly)
+const PER_COLOR    = 6;
+const PER_KIND     = 6;
+
+// ── ID Generation ─────────────────────────────────────────────────────────────
+const gid = () =>
+  typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID()
+    : Math.random().toString(36).slice(2, 9);
+
+// ── Special Abilities ─────────────────────────────────────────────────────────
+const ABILITIES = [
+  { id:"aggressive", label:"強気入札", short:"⚡強気", icon:"⚡",
+    desc:"このラウンドの入札上限+2（最大7コイン）", needsTarget:false },
+  { id:"shield",     label:"泡膜保護", short:"🫧保護", icon:"🫧",
+    desc:"指定した1枚で同点になっても、ペナルティ-1を受けない", needsTarget:true },
+  { id:"bargain",    label:"値切り",   short:"✂値切", icon:"✂️",
+    desc:"このラウンドで落札したカード1枚の支払い-1（最低0）", needsTarget:false },
+  { id:"reserve",    label:"温存回収", short:"💧温存", icon:"💧",
+    desc:"このラウンドで1枚も落札できなかった場合、+1コイン", needsTarget:false },
+];
+const findAbility = id => ABILITIES.find(a => a.id === id);
+
+// ── Objectives ────────────────────────────────────────────────────────────────
+function mkObjectives() {
+  const rColor = COLORS[Math.floor(Math.random() * COLORS.length)];
+  const compPool = [
+    { id:"most_color", kind:"competitive", icon:"🎨",
+      label:`${COLOR_LABELS[rColor]}カード最多`, short:`${COLOR_LABELS[rColor]}最多`,
+      desc:`ゲーム終了時、${COLOR_LABELS[rColor]}のカードを最多保有するプレイヤーに+5点（同率+3点）`,
+      winPts:5, tiePts:3,
+      calc:(p,all)=>{ const f=q=>q.collected.filter(c=>c.color===rColor).length; const mx=Math.max(...all.map(f)); if(mx===0||f(p)<mx)return 0; return all.filter(q=>f(q)===mx).length===1?5:3; } },
+    { id:"most_coins", kind:"competitive", icon:"💰",
+      label:"残コイン最多", short:"コイン最多",
+      desc:"ゲーム終了時、残コインが最多のプレイヤーに+4点（同率+2点）",
+      winPts:4, tiePts:2,
+      calc:(p,all)=>{ const mx=Math.max(...all.map(q=>q.coins)); if(p.coins<mx)return 0; return all.filter(q=>q.coins===mx).length===1?4:2; } },
+    { id:"most_4pt", kind:"competitive", icon:"⭐",
+      label:"4ptカード最多", short:"4pt最多",
+      desc:"ゲーム終了時、基本点4ptのカードを最多保有するプレイヤーに+5点（同率+3点）",
+      winPts:5, tiePts:3,
+      calc:(p,all)=>{ const f=q=>q.collected.filter(c=>c.basePoints===4).length; const mx=Math.max(...all.map(f)); if(mx===0||f(p)<mx)return 0; return all.filter(q=>f(q)===mx).length===1?5:3; } },
+  ];
+  const achPool = [
+    { id:"four_kinds", kind:"achievement", icon:"🌈",
+      label:"種類コレクター", short:"4種類以上",
+      desc:"異なる種類を4種類以上集めると+4点",
+      pts:4, calc:(p)=>new Set(p.collected.map(c=>c.kind)).size>=4?4:0 },
+    { id:"two_color_sets", kind:"achievement", icon:"✨",
+      label:"ダブルセット", short:"色セット×2",
+      desc:"同じ色3枚セットを2回以上達成で+4点",
+      pts:4, calc:(p)=>{ const cc={}; p.collected.forEach(c=>{cc[c.color]=(cc[c.color]||0)+1;}); return Object.values(cc).reduce((s,n)=>s+Math.floor(n/3),0)>=2?4:0; } },
+    { id:"seven_cards", kind:"achievement", icon:"📦",
+      label:"大量獲得", short:"7枚以上",
+      desc:"カード総枚数7枚以上で+4点",
+      pts:4, calc:(p)=>p.collected.length>=7?4:0 },
+  ];
+  return [
+    compPool[Math.floor(Math.random()*compPool.length)],
+    achPool[Math.floor(Math.random()*achPool.length)],
+  ];
+}
+
+function calcObjectiveBonuses(player, allPlayers, objectives) {
+  return objectives.map(obj => ({ id:obj.id, label:obj.label, icon:obj.icon, bonus:obj.calc(player, allPlayers) }));
+}
+
+// ── Deck ──────────────────────────────────────────────────────────────────────
+function mkDeck() {
+  const pts = [1,2,3,4];
+  const cards = [];
+  // 5×5 = 25 unique combos (each color×kind once)
+  COLORS.forEach(color => KINDS.forEach(kind => {
+    cards.push({ id:gid(), color, kind, basePoints:pts[Math.floor(Math.random()*4)] });
+  }));
+  // 5 extras: one per color with staggered kind → each color ends up with 6 total
+  COLORS.forEach((color,i) => {
+    cards.push({ id:gid(), color, kind:KINDS[(i+2)%5], basePoints:pts[Math.floor(Math.random()*4)] });
+  });
+  // Fisher-Yates shuffle
+  for (let i=cards.length-1; i>0; i--) {
+    const j = Math.floor(Math.random()*(i+1));
+    [cards[i],cards[j]] = [cards[j],cards[i]];
+  }
+  return cards; // 30 cards total
+}
+
+// ── Dummy (market guardian for 2-player) ──────────────────────────────────────
+// Produces bids for 3 cards with total clamped to [2..5], no single value >3.
+// Avoids the skew of the old "subtract from max" approach.
+function mkDummy() {
+  // Pick total in [2..5] uniformly, then distribute across 3 slots
+  const total = 2 + Math.floor(Math.random() * 4); // 2,3,4,5
+  const b = [0, 0, 0];
+  for (let t = 0; t < total; t++) {
+    // Find slots that can still receive a point (max 3 each)
+    const eligible = [0,1,2].filter(i => b[i] < 3);
+    if (eligible.length === 0) break;
+    b[eligible[Math.floor(Math.random() * eligible.length)]]++;
+  }
+  return b;
+}
+
+// ── Scoring ───────────────────────────────────────────────────────────────────
+function calcScore(coll) {
+  const base = coll.reduce((s,c)=>s+c.basePoints,0);
+  const cc={},kc={};
+  coll.forEach(c=>{cc[c.color]=(cc[c.color]||0)+1;kc[c.kind]=(kc[c.kind]||0)+1;});
+  let colorSet=0; Object.values(cc).forEach(n=>{colorSet+=Math.floor(n/3)*4;});
+  let kindSet=0;  Object.values(kc).forEach(n=>{kindSet+=Math.floor(n/2)*3;});
+  const rainbow = COLORS.every(c=>(cc[c]||0)>=1)?6:0;
+  return {base,colorSet,kindSet,rainbow,total:base+colorSet+kindSet+rainbow};
+}
+
+function calcFullScore(player, allPlayers, objectives) {
+  const base = calcScore(player.collected);
+  const objBonuses = calcObjectiveBonuses(player, allPlayers, objectives);
+  const objTotal = objBonuses.reduce((s,o)=>s+o.bonus,0);
+  return {...base, objBonuses, objTotal, grandTotal:base.total+objTotal};
+}
+
+// ── Rank calculation (pure function) ──────────────────────────────────────────
+// Tiebreak order: grandTotal → coins → collected.length → same rank
+function rankPlayers(players, objectives) {
+  const withScores = players.map(p => ({
+    ...p,
+    fs: calcFullScore(p, players, objectives),
+  }));
+  // Sort descending: grandTotal, then coins, then card count
+  const sorted = [...withScores].sort((a,b) => {
+    if (b.fs.grandTotal !== a.fs.grandTotal) return b.fs.grandTotal - a.fs.grandTotal;
+    if (b.coins !== a.coins) return b.coins - a.coins;
+    return b.collected.length - a.collected.length;
+  });
+  // Assign ranks: same rank if same grandTotal (coins/cards break ties in display order only)
+  let rank = 1;
+  return sorted.map((p, i) => {
+    if (i > 0 && sorted[i-1].fs.grandTotal > p.fs.grandTotal) rank = i + 1;
+    return { ...p, rank };
+  });
+}
+
+// ── Deck statistics (pure function) ──────────────────────────────────────────
+// visibleCards = history cards already resolved + current market cards
+function calcDeckStats(visibleCards) {
+  const colorCount = Object.fromEntries(COLORS.map(c=>[c,0]));
+  const kindCount  = Object.fromEntries(KINDS.map(k=>[k,0]));
+  visibleCards.forEach(c=>{colorCount[c.color]++;kindCount[c.kind]++;});
+  return { colorCount, kindCount, totalVisible: visibleCards.length };
+}
+
+// ── Game Init ─────────────────────────────────────────────────────────────────
+function initGame(pc, pnames) {
+  const fullDeck  = mkDeck();
+  const market    = fullDeck.slice(0, CARDS_PER_ROUND);
+  const deck      = fullDeck.slice(CARDS_PER_ROUND);
+  const objectives = mkObjectives();
+  const players = Array.from({length:pc}, (_,i) => ({
+    id:gid(), name:pnames[i]||`Player ${i+1}`, ci:i,
+    coins:START_COINS, collected:[],
+    abilityUsedFirst:false, abilityUsedSecond:false,
+    abilityUsedFirstType:null, abilityUsedSecondType:null,
+  }));
+  return {
+    phase:"market", pc, players,
+    round:1, market, deck,
+    bidIdx:0, bids:[],
+    dummy: pc===2 ? mkDummy() : null,
+    reveal:null,
+    history:[],      // array of resolved round results
+    objectives,
+    // revealedCards: past rounds' cards (not including current market)
+    // Used for deck stats. Current market is added separately in calcDeckStats.
+    revealedCards:[],
+  };
+}
+
+// ── Resolve Bids ──────────────────────────────────────────────────────────────
+// Returns updated game state with ability effect log attached to reveal
+function resolveBids(g) {
+  const {bids, dummy:dm, market:cards, players, round} = g;
+  const np = players.map(p => ({...p, collected:[...p.collected]}));
+  const winners=[], cardResults=[];
+  const winsThisRound = Object.fromEntries(np.map(p=>[p.id,0]));
+
+  // ── Per-card resolution ───
+  for (let ci=0; ci<CARDS_PER_ROUND; ci++) {
+    let mx=0, mxPids=[];
+    bids.forEach(b => {
+      const v = b.al[ci];
+      if (v > mx)      { mx=v; mxPids=[b.pid]; }
+      else if (v===mx && v>0) mxPids.push(b.pid);
+    });
+    const dv = dm ? dm[ci] : 0;
+    let dummyWins = false;
+    if (dm) {
+      if (dv > mx)       { mx=dv; mxPids=[]; dummyWins=true; }
+      else if (dv===mx && dv>0) mxPids.push("dummy");
+    }
+
+    if (mx === 0) {
+      winners.push(null);
+      cardResults.push({winner:null, tiedPids:[], penaltyPids:[], maxBid:0});
+    } else if (dummyWins) {
+      winners.push("dummy");
+      cardResults.push({winner:"dummy", tiedPids:[], penaltyPids:[], maxBid:mx});
+    } else if (mxPids.length===1 && mxPids[0]!=="dummy") {
+      const wid = mxPids[0];
+      winners.push(wid);
+      const pl = np.find(p=>p.id===wid);
+      pl.coins -= bids.find(b=>b.pid===wid).al[ci];
+      pl.collected.push(cards[ci]);
+      winsThisRound[wid]++;
+      cardResults.push({winner:wid, tiedPids:[], penaltyPids:[], maxBid:mx});
+    } else {
+      winners.push("tie-pop");
+      const penaltyPids = mxPids.filter(pid => {
+        if (pid==="dummy") return false;
+        const bid = bids.find(b=>b.pid===pid);
+        // shield ability on this card index = immunity
+        if (bid?.ability?.type==="shield" && bid?.ability?.cardIdx===ci) return false;
+        return true;
+      });
+      penaltyPids.forEach(tid => {
+        const pl = np.find(p=>p.id===tid);
+        if (pl) pl.coins = Math.max(0, pl.coins-1);
+      });
+      // Record shield-protected pids for display
+      const shieldedPids = mxPids.filter(pid => {
+        if (pid==="dummy") return false;
+        const bid = bids.find(b=>b.pid===pid);
+        return bid?.ability?.type==="shield" && bid?.ability?.cardIdx===ci;
+      });
+      cardResults.push({winner:"tie-pop", tiedPids:mxPids, penaltyPids, shieldedPids, maxBid:mx});
+    }
+  }
+
+  // ── Post-round ability effects ───
+  const isFirstHalf = round <= 4;
+  const abilityLog = []; // {pid, type, effect, effectLabel}
+
+  bids.forEach(bid => {
+    if (!bid.ability) return;
+    const pl = np.find(p=>p.id===bid.pid);
+    if (!pl) return;
+    const {type, cardIdx} = bid.ability;
+
+    let effectLabel = null;
+    if (type==="aggressive") {
+      effectLabel = "入札上限+2で使用";
+    }
+    if (type==="shield") {
+      // Check if the shield actually triggered on any tied card
+      const cr = cardResults[cardIdx];
+      const didTrigger = cr && cr.shieldedPids && cr.shieldedPids.includes(bid.pid);
+      effectLabel = didTrigger ? "同点ペナルティを無効化！" : "発動なし（同点にならず）";
+    }
+    if (type==="bargain") {
+      if (winsThisRound[bid.pid] > 0) {
+        pl.coins += 1;
+        effectLabel = "落札カード支払い −1 (返金+1🪙)";
+      } else {
+        effectLabel = "発動なし（落札なし）";
+      }
+    }
+    if (type==="reserve") {
+      if (winsThisRound[bid.pid] === 0) {
+        pl.coins += 1;
+        effectLabel = "未落札のため +1🪙 回収";
+      } else {
+        effectLabel = "発動なし（落札あり）";
+      }
+    }
+
+    // Mark ability as used
+    if (isFirstHalf) { pl.abilityUsedFirst=true; pl.abilityUsedFirstType=type; }
+    else             { pl.abilityUsedSecond=true; pl.abilityUsedSecondType=type; }
+
+    abilityLog.push({ pid:bid.pid, type, effectLabel });
+  });
+
+  const rv = {cards, bids, dummy:dm, winners, cardResults, abilityLog};
+  return {...g, players:np, reveal:rv, phase:"reveal", history:[...g.history, rv]};
+}
+
+// ── Audio ─────────────────────────────────────────────────────────────────────
+function useAudio() {
+  const synthRef=useRef(null), reverbRef=useRef(null), dryRef=useRef(null);
+  const loopRef=useRef(null), playingRef=useRef(false);
+  const [isOn,setIsOn]=useState(false);
+
+  useEffect(()=>()=>{
+    loopRef.current?.stop(); loopRef.current?.dispose();
+    Tone.getTransport().stop();
+    synthRef.current?.dispose(); reverbRef.current?.dispose(); dryRef.current?.dispose();
+  },[]);
+
+  const init=useCallback(async()=>{
+    if(synthRef.current) return;
+    await Tone.start();
+    const reverb=new Tone.Reverb({decay:3,wet:0.35}).toDestination();
+    const dry=new Tone.Volume(-26).toDestination();
+    const synth=new Tone.PolySynth(Tone.Synth,{oscillator:{type:"sine"},envelope:{attack:0.3,decay:0.6,sustain:0.4,release:1.2},volume:-20});
+    synth.connect(reverb); synth.connect(dry);
+    reverbRef.current=reverb; dryRef.current=dry; synthRef.current=synth;
+    const notes=[["E4","G4"],["B3","D4"],["A3","C4"],["E4","G4"],["D4","F4"],["C4","E4"],["G3","B3"],["A3","E4"],["F4","A4"],["E4","G4"],["D4","F4"],["C4","E4"],["B3","D4"],["A3","C4"],["G3","B3"],["A3","E4"]];
+    let idx=0;
+    loopRef.current=new Tone.Loop(t=>{synth.triggerAttackRelease(notes[idx++%notes.length],"2n",t);},"1n");
+    Tone.getTransport().bpm.value=56;
+  },[]);
+
+  const toggle=useCallback(async()=>{
+    await init();
+    if(playingRef.current){loopRef.current?.stop();Tone.getTransport().stop();playingRef.current=false;setIsOn(false);}
+    else{loopRef.current?.start(0);Tone.getTransport().start();playingRef.current=true;setIsOn(true);}
+  },[init]);
+
+  const sfx=useCallback(async(type)=>{
+    await init(); const s=synthRef.current; if(!s) return;
+    const now=Tone.now();
+    if(type==="bid")  s.triggerAttackRelease(["C5","E5"],"16n",now,0.3);
+    if(type==="pop"){s.triggerAttackRelease(["E5","G5"],"32n",now,0.4);s.triggerAttackRelease(["C5"],"32n",now+0.08,0.2);}
+    if(type==="win")  s.triggerAttackRelease(["C5","E5","G5"],"8n",now,0.35);
+    if(type==="coin") s.triggerAttackRelease(["A5"],"32n",now,0.2);
+  },[init]);
+
+  return {isOn,toggle,sfx};
+}
+
+// ── SVG Components ────────────────────────────────────────────────────────────
+const SvgBubble=({size=48,color="#4e8fd9"})=>(
+  <svg width={size} height={size} viewBox="0 0 48 48" fill="none">
+    <circle cx="24" cy="24" r="21" fill={color} opacity="0.07"/>
+    <circle cx="24" cy="24" r="17" fill={color} opacity="0.13"/>
+    <circle cx="24" cy="24" r="13" fill={color} opacity="0.22"/>
+    <circle cx="24" cy="24" r="13" fill="none" stroke={color} strokeWidth="1.5" opacity="0.4"/>
+    <ellipse cx="18" cy="17" rx="4.5" ry="3" fill="white" opacity="0.65" transform="rotate(-25 18 17)"/>
+    <ellipse cx="29" cy="29" rx="2" ry="1.5" fill="white" opacity="0.28"/>
+  </svg>
+);
+const SvgKind=({kind,size=28})=>{
+  const p={
+    star:<><path d="M14 3l3.1 6.3 7 1-5 4.9 1.2 7L14 18.8l-6.3 3.4 1.2-7-5-4.9 7-1z" fill="#e8b84b" opacity="0.9"/><path d="M14 6l2.1 4.3 4.8.7-3.5 3.4.8 4.8L14 16.8l-4.2 2.4.8-4.8-3.5-3.4 4.8-.7z" fill="#f5d280"/></>,
+    moon:<><path d="M20 6a10 10 0 1 0 0 16 8 8 0 0 1 0-16z" fill="#b8c5e8" opacity="0.7"/><path d="M18 8a8 8 0 1 0 0 12 6.5 6.5 0 0 1 0-12z" fill="#d0daf0"/></>,
+    cloud:<><ellipse cx="14" cy="17" rx="10" ry="6" fill="#d0e6f5" opacity="0.6"/><circle cx="10" cy="14" r="5" fill="#dce9f5"/><circle cx="17" cy="13" r="6" fill="#e8f0f8"/><circle cx="13" cy="11" r="4" fill="#f0f5fa"/></>,
+    drop:<><path d="M14 4c0 0-8 9-8 15a8 8 0 0 0 16 0c0-6-8-15-8-15z" fill="#7bc5e8" opacity="0.6"/><path d="M14 8c0 0-5 6-5 10a5 5 0 0 0 10 0c0-4-5-10-5-10z" fill="#a8ddf0"/></>,
+    flame:<><path d="M14 3c0 0-8 8-8 15a8 8 0 0 0 16 0c0-7-8-15-8-15z" fill="#f0a040" opacity="0.5"/><path d="M14 8c0 0-5 5-5 10a5 5 0 0 0 10 0c0-5-5-10-5-10z" fill="#f0c060" opacity="0.7"/><path d="M14 13c0 0-2.5 3-2.5 6a2.5 2.5 0 0 0 5 0c0-3-2.5-6-2.5-6z" fill="#f8e0a0"/></>,
+  };
+  return <svg width={size} height={size} viewBox="0 0 28 28" fill="none">{p[kind]}</svg>;
+};
+const SvgCoin=({size=20})=>(
+  <svg width={size} height={size} viewBox="0 0 20 20" fill="none" style={{verticalAlign:"middle",flexShrink:0}}>
+    <circle cx="10" cy="10" r="9" fill="#f0c040" stroke="#c49010" strokeWidth="1.2"/>
+    <circle cx="10" cy="10" r="6.5" fill="none" stroke="#c49010" strokeWidth="0.8" opacity="0.4"/>
+    <text x="10" y="13.5" textAnchor="middle" fill="#7a5800" fontSize="8.5" fontWeight="bold" fontFamily="sans-serif">¢</text>
+  </svg>
+);
+const SvgCrown=({size=28})=>(
+  <svg width={size} height={size} viewBox="0 0 28 28" fill="none">
+    <path d="M4 20l3-10 4 5 3-8 3 8 4-5 3 10z" fill="#f0c040" stroke="#c49010" strokeWidth="0.8"/>
+    <rect x="4" y="20" width="20" height="3" rx="1" fill="#f0c040" stroke="#c49010" strokeWidth="0.8"/>
+    <circle cx="7" cy="10" r="1.3" fill="#e86b8a"/><circle cx="14" cy="7" r="1.3" fill="#4e8fd9"/><circle cx="21" cy="10" r="1.3" fill="#35a970"/>
+  </svg>
+);
+const SvgPop=({size=22})=>(
+  <svg width={size} height={size} viewBox="0 0 40 40" fill="none">
+    <circle cx="20" cy="20" r="8" fill="#e25b6a" opacity="0.22"/>
+    {[0,60,120,180,240,300].map((a,i)=><circle key={i} cx={20+14*Math.cos(a*Math.PI/180)} cy={20+14*Math.sin(a*Math.PI/180)} r="2.5" fill="#e25b6a" opacity="0.55"/>)}
+  </svg>
+);
+const SvgMusicOn=()=><svg width="18" height="18" viewBox="0 0 22 22" fill="none"><path d="M8 5v10a3 3 0 1 1-2-2.8V7l8-2v9a3 3 0 1 1-2-2.8V5z" fill="currentColor" opacity="0.85"/></svg>;
+const SvgMusicOff=()=><svg width="18" height="18" viewBox="0 0 22 22" fill="none"><path d="M8 5v10a3 3 0 1 1-2-2.8V7l8-2v9a3 3 0 1 1-2-2.8V5z" fill="currentColor" opacity="0.25"/><line x1="3" y1="3" x2="19" y2="19" stroke="currentColor" strokeWidth="2" opacity="0.6"/></svg>;
+const SvgExit=()=><svg width="17" height="17" viewBox="0 0 20 20" fill="none"><path d="M7 3H4a1 1 0 0 0-1 1v12a1 1 0 0 0 1 1h3M10 14l4-4-4-4M14 10H7" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"/></svg>;
+const SvgEye=()=><svg width="14" height="14" viewBox="0 0 18 18" fill="none"><path d="M1 9s3-5.5 8-5.5S17 9 17 9s-3 5.5-8 5.5S1 9 1 9z" stroke="currentColor" strokeWidth="1.5"/><circle cx="9" cy="9" r="2.5" stroke="currentColor" strokeWidth="1.5"/></svg>;
+const SvgChev=({up})=><svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d={up?"M4 10l4-4 4 4":"M4 6l4 4 4-4"} stroke="currentColor" strokeWidth="2" strokeLinecap="round"/></svg>;
+const SvgInfo=()=><svg width="17" height="17" viewBox="0 0 20 20" fill="none"><circle cx="10" cy="10" r="8.5" stroke="currentColor" strokeWidth="1.6"/><path d="M10 9v5M10 7v.5" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"/></svg>;
+
+// ── CSS ────────────────────────────────────────────────────────────────────────
+const css=`
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700;800;900&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap');
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#aec4dc;
+  --bg2:#bdd0e5;
+  --panel:#e4eef8;
+  --surface:rgba(250,253,255,0.97);
+  --surface-hi:#ffffff;
+  --border:rgba(60,100,160,0.13);
+  --border-hi:rgba(60,100,160,0.24);
+  --text:#0b1828;
+  --text2:#3a5570;
+  --text3:#7898b5;
+  --accent:#2c72d8;
+  --accent2:#d03858;
+  --gold:#c49010;
+  --green:#1f9858;
+  --r:16px;--rs:10px;
+  --sh:0 4px 18px rgba(12,35,75,0.12),0 1px 4px rgba(12,35,75,0.07);
+  --sh2:0 8px 32px rgba(12,35,75,0.18),0 2px 8px rgba(12,35,75,0.1);
+  --sh-btn:0 5px 0 rgba(0,0,0,0.2),0 8px 20px rgba(12,35,75,0.2);
+}
+body{font-family:'Plus Jakarta Sans',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;overflow-x:hidden;-webkit-font-smoothing:antialiased}
+.app{max-width:440px;margin:0 auto;min-height:100dvh;position:relative;padding-bottom:env(safe-area-inset-bottom,20px)}
+.fd{font-family:'Outfit',sans-serif}
+
+/* ── Layers ─────────── */
+.ambient{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden}
+.amb-orb{position:absolute;border-radius:50%;filter:blur(80px);opacity:0.2;animation:od 22s ease-in-out infinite alternate}
+@keyframes od{0%{transform:translate(0,0) scale(1)}50%{transform:translate(26px,-34px) scale(1.1)}100%{transform:translate(-16px,24px) scale(0.92)}}
+.bub-bg{position:fixed;inset:0;pointer-events:none;z-index:0;overflow:hidden}
+.bub-f{position:absolute;border-radius:50%;background:radial-gradient(circle at 35% 30%,rgba(255,255,255,0.7),rgba(60,120,220,0.04));animation:fu linear infinite;opacity:0.3}
+@keyframes fu{0%{transform:translateY(105vh) scale(0.4);opacity:0}8%{opacity:0.3}88%{opacity:0.12}100%{transform:translateY(-8vh) scale(1.05);opacity:0}}
+
+/* ── Layout ─────────── */
+.scr{position:relative;z-index:1;padding:8px 16px 36px}
+
+/* ── Header ─────────── */
+.hdr{
+  display:flex;align-items:center;justify-content:space-between;gap:6px;
+  padding:0 12px;height:56px;
+  padding-top:env(safe-area-inset-top,0px);
+  position:sticky;top:0;z-index:50;
+  background:linear-gradient(to bottom,rgba(174,196,220,0.98) 70%,rgba(174,196,220,0));
+  backdrop-filter:blur(12px);
+  border-bottom:1px solid rgba(255,255,255,0.35);
+}
+.hdr-left{display:flex;align-items:center;gap:6px;flex:1;min-width:0;overflow:hidden}
+.hdr-right{display:flex;align-items:center;gap:5px;flex-shrink:0}
+.icon-btn{
+  width:44px;height:44px;min-width:44px;border-radius:50%;
+  border:1px solid var(--border-hi);background:var(--surface-hi);
+  box-shadow:var(--sh);cursor:pointer;
+  display:flex;align-items:center;justify-content:center;
+  color:var(--text2);transition:transform 0.11s,box-shadow 0.11s;
+  -webkit-tap-highlight-color:transparent;
+}
+.icon-btn:active{transform:scale(0.87);box-shadow:0 1px 4px rgba(0,0,0,0.08)}
+.icon-btn.danger{color:var(--accent2)}
+.rbg{background:var(--accent);color:#fff;padding:5px 12px;border-radius:14px;font-weight:800;font-size:12.5px;font-family:'Outfit';letter-spacing:0.04em;box-shadow:0 2px 8px rgba(44,114,216,0.3);white-space:nowrap}
+.deck-badge{background:rgba(255,255,255,0.7);color:var(--text2);padding:4px 9px;border-radius:12px;font-size:11px;font-weight:700;border:1px solid var(--border-hi);white-space:nowrap;display:flex;align-items:center;gap:3px}
+.cinc{background:linear-gradient(135deg,#f5c842,#c49010);color:#fff;padding:3px 9px;border-radius:12px;font-weight:700;font-size:11px;display:flex;align-items:center;gap:2px;box-shadow:0 2px 6px rgba(196,144,16,0.25)}
+
+/* ── Buttons ─────────── */
+.btn{
+  display:inline-flex;align-items:center;justify-content:center;gap:7px;
+  padding:14px 22px;border:none;border-radius:var(--r);
+  font-family:'Plus Jakarta Sans',sans-serif;font-size:15px;font-weight:700;
+  cursor:pointer;min-height:52px;letter-spacing:0.01em;
+  position:relative;overflow:hidden;
+  transition:transform 0.1s,box-shadow 0.1s;
+  -webkit-tap-highlight-color:transparent;
+}
+.btn:active{transform:translateY(3px)}
+.btn:disabled{opacity:0.35;cursor:not-allowed;transform:none}
+.btn-p{background:linear-gradient(165deg,#4a8de8,#1d5ec4);color:#fff;box-shadow:0 5px 0 #1245a0,0 8px 20px rgba(18,69,160,0.35)}
+.btn-p:active{box-shadow:0 2px 0 #1245a0,0 4px 10px rgba(18,69,160,0.2)}
+.btn-s{background:var(--surface-hi);color:var(--text);border:1.5px solid var(--border-hi);box-shadow:var(--sh)}
+.btn-g{background:linear-gradient(165deg,#e8b030,#b87808);color:#fff;box-shadow:0 5px 0 #8a5800,0 8px 20px rgba(140,90,0,0.3)}
+.btn-g:active{box-shadow:0 2px 0 #8a5800,0 4px 10px rgba(140,90,0,0.2)}
+.btn-d{background:linear-gradient(165deg,#e24060,#b01838);color:#fff;box-shadow:0 5px 0 #800020,0 8px 20px rgba(128,0,32,0.3)}
+.btn-d:active{box-shadow:0 2px 0 #800020,0 4px 10px rgba(128,0,32,0.2)}
+.btn-gh{background:transparent;color:var(--text2);padding:10px 14px;min-height:44px;font-size:13px;box-shadow:none}
+.btn-f{width:100%}
+.btn-sm{padding:10px 16px;font-size:13.5px;min-height:44px}
+
+/* ── Panels ─────────── */
+.panel{background:var(--panel);border-radius:var(--r);padding:16px;box-shadow:var(--sh);border:1px solid rgba(255,255,255,0.6)}
+
+/* ── BCard ─────────── */
+.bcard{
+  border-radius:var(--r);padding:14px 16px;position:relative;overflow:hidden;
+  background:linear-gradient(160deg,#f8fbff 0%,#eef4fc 100%);
+  border:1px solid rgba(190,215,240,0.7);
+  border-top:1px solid rgba(255,255,255,0.95);
+  box-shadow:0 6px 24px rgba(12,35,75,0.14),0 2px 6px rgba(12,35,75,0.08);
+  transition:transform 0.15s,box-shadow 0.15s;
+}
+.bcard::before{content:'';position:absolute;top:0;left:0;right:0;height:45%;background:linear-gradient(to bottom,rgba(255,255,255,0.55),transparent);pointer-events:none}
+.bcard-row{display:flex;align-items:center;gap:12px}
+.bcard-ic{width:48px;height:48px;border-radius:13px;display:flex;align-items:center;justify-content:center;flex-shrink:0;background:rgba(255,255,255,0.7);box-shadow:0 2px 6px rgba(0,0,0,0.07)}
+.bcard-inf{flex:1;min-width:0}
+.bcard-tag{display:inline-block;padding:3px 11px;border-radius:16px;font-size:10.5px;font-weight:800;color:#fff;letter-spacing:0.06em;box-shadow:0 2px 6px rgba(0,0,0,0.18)}
+.bcard-kn{font-size:13px;color:var(--text2);font-weight:500;margin-top:3px}
+.bcard-pt{font-size:30px;font-weight:900;color:var(--text);text-align:right;min-width:38px;font-family:'Outfit';letter-spacing:-0.5px}
+.bcard-pt small{font-size:12px;font-weight:500;color:var(--text3);letter-spacing:0}
+
+/* ── Bid ─────────── */
+.bid-row{display:flex;align-items:center;gap:10px;margin-top:11px;padding:9px 12px;background:rgba(255,255,255,0.5);border-radius:var(--rs);border:1px solid var(--border-hi)}
+.bid-btn{width:44px;height:44px;border-radius:50%;border:1.5px solid rgba(44,114,216,0.2);background:var(--surface-hi);font-size:22px;font-weight:700;color:var(--accent);cursor:pointer;display:flex;align-items:center;justify-content:center;transition:transform 0.09s,background 0.09s;box-shadow:0 2px 6px rgba(0,0,0,0.08);-webkit-tap-highlight-color:transparent}
+.bid-btn:active{transform:scale(0.82);background:var(--accent);color:#fff;box-shadow:0 0 0 4px rgba(44,114,216,0.18)}
+.bid-btn:disabled{opacity:0.18;cursor:not-allowed;transform:none;box-shadow:none}
+.bid-val{font-size:32px;font-weight:900;min-width:42px;text-align:center;font-family:'Outfit';letter-spacing:-1px;transition:transform 0.1s,color 0.1s}
+.bid-val.pop{animation:bidpop 0.14s cubic-bezier(0.34,1.56,0.64,1)}
+@keyframes bidpop{0%{transform:scale(1)}50%{transform:scale(1.3)}100%{transform:scale(1)}}
+.bid-total{display:flex;align-items:center;justify-content:center;gap:5px;font-size:17px;font-weight:900;margin-bottom:10px;font-family:'Outfit';letter-spacing:-0.3px;transition:color 0.2s}
+
+/* ── Ability selector ─ */
+.abl-toggle{display:flex;align-items:center;justify-content:space-between;padding:10px 13px;background:rgba(255,255,255,0.4);border-radius:var(--rs);border:1px solid var(--border-hi);cursor:pointer;font-size:12.5px;font-weight:700;color:var(--text2);-webkit-tap-highlight-color:transparent}
+.abl-toggle.active{background:rgba(255,240,200,0.5);border-color:rgba(196,144,16,0.35);color:#7a5a00}
+.abl-grid{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:7px}
+.abl-card{padding:10px 11px;border-radius:var(--rs);border:1.5px solid var(--border-hi);background:var(--surface-hi);cursor:pointer;transition:all 0.12s;-webkit-tap-highlight-color:transparent}
+.abl-card.sel{border-color:var(--gold);background:rgba(255,240,180,0.5);box-shadow:0 0 0 3px rgba(196,144,16,0.15)}
+.abl-card.none-sel{border-color:rgba(140,160,180,0.4);background:rgba(240,244,248,0.6)}
+.abl-card:active{transform:scale(0.96)}
+.abl-icon{font-size:18px;margin-bottom:3px}
+.abl-name{font-size:12px;font-weight:800;color:var(--text)}
+.abl-desc{font-size:10.5px;color:var(--text2);line-height:1.4;margin-top:2px}
+.abl-target{display:flex;gap:7px;margin-top:7px}
+.abl-tcard{flex:1;padding:8px;border-radius:var(--rs);border:1.5px solid var(--border-hi);background:var(--surface-hi);text-align:center;cursor:pointer;font-size:11px;font-weight:700;-webkit-tap-highlight-color:transparent}
+.abl-tcard.sel{border-color:var(--accent);background:rgba(44,114,216,0.08)}
+.abl-used{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:700;background:rgba(200,200,200,0.3);color:var(--text3)}
+.abl-effect{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:10px;font-size:11px;font-weight:700;background:rgba(44,114,216,0.08);color:var(--accent)}
+.abl-effect.triggered{background:rgba(31,152,88,0.1);color:var(--green)}
+.abl-effect.no-trigger{background:rgba(140,160,180,0.08);color:var(--text3)}
+
+/* ── Setup ─────────── */
+.srow{display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--surface-hi);border-radius:var(--rs);margin-bottom:6px;box-shadow:var(--sh);border:1px solid var(--border)}
+.sdot{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:13.5px;flex-shrink:0;font-family:'Outfit'}
+.sinp{flex:1;padding:10px 13px;border:1.5px solid var(--border-hi);border-radius:var(--rs);font-family:'Plus Jakarta Sans';font-size:14px;background:#fff;color:var(--text);outline:none;transition:border 0.18s,box-shadow 0.18s}
+.sinp:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(44,114,216,0.12)}
+.sinp::placeholder{color:#b0c5d8}
+.csel{display:flex;gap:10px;justify-content:center;margin:14px 0}
+.cbtn{width:54px;height:54px;border-radius:50%;border:2px solid var(--border-hi);background:var(--surface-hi);font-size:21px;font-weight:800;color:var(--text);cursor:pointer;transition:all 0.13s;font-family:'Outfit';box-shadow:var(--sh);-webkit-tap-highlight-color:transparent}
+.cbtn.on{border-color:var(--accent);background:linear-gradient(135deg,#4a8de8,#1d5ec4);color:#fff;box-shadow:0 5px 0 #1245a0,0 8px 20px rgba(18,69,160,0.3)}
+
+/* ── PBar ─────────── */
+.pbar{display:flex;gap:6px;padding:0 0 12px;overflow-x:auto}
+.pchip{flex:1;min-width:0;padding:8px 6px;border-radius:12px;text-align:center;border:1.5px solid transparent;background:var(--surface-hi);box-shadow:var(--sh)}
+.pchip-n{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:10.5px;margin-bottom:2px;font-weight:700}
+.pchip-c{font-size:16px;font-weight:900;font-family:'Outfit';display:flex;align-items:center;justify-content:center;gap:2px;letter-spacing:-0.3px}
+.pchip-k{font-size:9.5px;color:var(--text3);margin-top:1px}
+.cdots{display:flex;flex-wrap:wrap;gap:2px;margin-top:3px;justify-content:center}
+.cdot{width:7px;height:7px;border-radius:50%;border:0.5px solid rgba(255,255,255,0.6)}
+
+/* ── Objectives bar ─ */
+.obj-bar{display:flex;gap:7px;margin-bottom:12px}
+.obj-chip{flex:1;padding:8px 10px;border-radius:var(--rs);background:var(--surface-hi);border:1px solid var(--border-hi);box-shadow:var(--sh);cursor:pointer;-webkit-tap-highlight-color:transparent}
+.obj-chip-hd{display:flex;align-items:center;gap:5px;font-size:11px;font-weight:800;color:var(--text)}
+.obj-chip-sub{font-size:10px;color:var(--text3);margin-top:2px}
+.obj-detail{margin-top:8px;background:var(--surface-hi);border-radius:var(--rs);padding:12px;box-shadow:var(--sh);border:1px solid var(--border)}
+.obj-kind-badge{display:inline-flex;align-items:center;gap:3px;padding:2px 8px;border-radius:10px;font-size:10px;font-weight:800;margin-bottom:6px}
+.obj-kind-comp{background:rgba(44,114,216,0.1);color:var(--accent)}
+.obj-kind-ach{background:rgba(31,152,88,0.1);color:var(--green)}
+.obj-pts-row{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.obj-pl-pt{padding:3px 8px;border-radius:10px;font-size:11px;font-weight:700;display:inline-flex;align-items:center;gap:3px}
+
+/* ── Deck stats panel ─ */
+.ds-toggle{display:flex;align-items:center;gap:6px;padding:9px 13px;background:rgba(255,255,255,0.4);border-radius:var(--rs);cursor:pointer;font-size:12px;font-weight:700;color:var(--text2);border:1px solid var(--border-hi);width:100%;-webkit-tap-highlight-color:transparent;margin-bottom:8px}
+.ds-body{background:var(--surface-hi);border-radius:var(--rs);padding:12px;border:1px solid var(--border);box-shadow:var(--sh);margin-bottom:10px}
+.ds-section{margin-bottom:10px}
+.ds-section:last-child{margin-bottom:0}
+.ds-hd{font-size:10.5px;font-weight:800;color:var(--text3);letter-spacing:0.05em;margin-bottom:6px}
+.ds-grid{display:flex;flex-wrap:wrap;gap:5px}
+.ds-chip{display:inline-flex;align-items:center;gap:4px;padding:3px 9px;border-radius:10px;font-size:11px;font-weight:700;border:1px solid transparent}
+.ds-chip-full{opacity:0.45}
+
+/* ── History panel ─ */
+.hist-toggle{display:flex;align-items:center;gap:6px;padding:9px 13px;background:rgba(255,255,255,0.4);border-radius:var(--rs);cursor:pointer;font-size:12px;font-weight:700;color:var(--text2);border:1px solid var(--border-hi);width:100%;-webkit-tap-highlight-color:transparent;margin-bottom:10px}
+.hist-body{background:var(--surface-hi);border-radius:var(--rs);padding:12px;border:1px solid var(--border);box-shadow:var(--sh);margin-bottom:10px}
+.hist-round{margin-bottom:10px}
+.hist-round:last-child{margin-bottom:0}
+.hist-rnd-hd{font-size:11px;font-weight:800;color:var(--text3);margin-bottom:6px;letter-spacing:0.04em}
+.hist-cards{display:flex;flex-wrap:wrap;gap:5px}
+.hist-card{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:9px;font-size:11px;font-weight:700;color:#fff}
+
+/* ── Reveal ─────────── */
+.rvc{margin-bottom:12px;padding:14px;border-radius:var(--r);background:var(--surface-hi);box-shadow:var(--sh2);border:1px solid rgba(190,215,240,0.7)}
+.rvb{display:flex;flex-wrap:wrap;gap:5px;margin-top:10px}
+.rvch{padding:4px 10px;border-radius:12px;font-size:11.5px;font-weight:700;display:inline-flex;align-items:center;gap:3px}
+.rvw{margin-top:9px;padding:8px 13px;border-radius:var(--rs);font-weight:700;font-size:13.5px;text-align:center;display:flex;align-items:center;justify-content:center;gap:6px;border:1px solid transparent;flex-wrap:wrap}
+.rvw-p{background:rgba(208,56,88,0.08);color:var(--accent2);border-color:rgba(208,56,88,0.2)}
+.rvw-g{background:rgba(31,152,88,0.08);color:#1a8048;border-color:rgba(31,152,88,0.2)}
+.rvw-n{background:rgba(140,160,180,0.08);color:var(--text3);border-color:rgba(140,160,180,0.15)}
+@keyframes rvslide{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:translateY(0)}}
+.rvc-a{animation:rvslide 0.28s ease-out both}
+@keyframes winpulse{0%,100%{box-shadow:var(--sh2)}50%{box-shadow:0 0 0 5px rgba(31,152,88,0.18),var(--sh2)}}
+.rvc-win{animation:winpulse 0.8s ease 0.35s}
+@keyframes popshake{0%,100%{transform:translateX(0)}20%{transform:translateX(-5px)}40%{transform:translateX(5px)}60%{transform:translateX(-3px)}80%{transform:translateX(3px)}}
+.rvc-pop{animation:popshake 0.38s ease 0.18s}
+.rv-abl-log{margin-top:9px;padding:9px 12px;border-radius:var(--rs);background:rgba(44,114,216,0.04);border:1px solid var(--border);display:flex;flex-direction:column;gap:5px}
+.rv-abl-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.rv-abl-name{font-size:12px;font-weight:700;color:var(--text2)}
+
+/* ── Result ─────────── */
+.rpl-winner{
+  padding:22px 18px;border-radius:20px;margin-bottom:12px;position:relative;overflow:hidden;
+  background:linear-gradient(135deg,#fffae8 0%,#fef0b0 50%,#fde898 100%);
+  border:2px solid #e8b820;
+  box-shadow:0 0 0 1px rgba(255,255,255,0.8) inset,0 10px 40px rgba(200,150,0,0.25),0 3px 10px rgba(0,0,0,0.1);
+  animation:winnerGlow 2.5s ease-in-out infinite alternate;
+}
+@keyframes winnerGlow{from{box-shadow:0 0 0 1px rgba(255,255,255,0.8) inset,0 8px 30px rgba(200,150,0,0.2),0 3px 10px rgba(0,0,0,0.1)}to{box-shadow:0 0 0 1px rgba(255,255,255,0.9) inset,0 12px 48px rgba(200,150,0,0.38),0 3px 10px rgba(0,0,0,0.1)}}
+.rpl-winner::before{content:'';position:absolute;top:0;left:0;right:0;height:50%;background:linear-gradient(to bottom,rgba(255,255,255,0.55),transparent);pointer-events:none}
+.winner-badge{position:absolute;top:14px;right:14px;background:linear-gradient(135deg,#e8b820,#c49010);color:#fff;font-size:10px;font-weight:800;padding:4px 10px;border-radius:12px;letter-spacing:0.06em;box-shadow:0 2px 8px rgba(196,144,16,0.4);font-family:'Outfit'}
+.rpl{padding:16px;border-radius:var(--r);margin-bottom:9px;position:relative;overflow:hidden;border:1.5px solid transparent;background:var(--surface-hi);box-shadow:var(--sh)}
+.rpl::before{content:'';position:absolute;top:0;left:12px;right:12px;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,0.8),transparent)}
+.rpl-rk{position:absolute;top:8px;right:12px;font-size:30px;font-weight:900;opacity:0.08;font-family:'Outfit'}
+.rpl-nm{font-size:17px;font-weight:800;margin-bottom:3px;font-family:'Outfit';display:flex;align-items:center;gap:5px}
+.rpl-sc{font-size:44px;font-weight:900;margin-bottom:6px;font-family:'Outfit';letter-spacing:-2px;line-height:1}
+.rpl-sc-sm{font-size:30px}
+.rpl-sc small{font-size:14px;font-weight:500;color:var(--text2);letter-spacing:0}
+.rpl-breakdown{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}
+.rpl-bp{display:inline-flex;align-items:center;gap:3px;padding:3px 9px;border-radius:10px;font-size:11.5px;font-weight:700;background:rgba(0,0,0,0.05);color:var(--text2)}
+.rpl-bp.pos{background:rgba(31,152,88,0.1);color:#1a8048}
+.rpl-bp.obj{background:rgba(196,144,16,0.12);color:#8a5a00}
+.rpl-abl-used{font-size:11px;color:var(--text3);margin-top:4px}
+.early-banner{padding:12px 14px;border-radius:var(--rs);background:rgba(208,56,88,0.07);border:1px solid rgba(208,56,88,0.2);margin-bottom:14px;font-size:12.5px;color:#a02040;font-weight:700;line-height:1.6}
+
+/* Obj result section */
+.obj-result{padding:14px;border-radius:var(--r);background:linear-gradient(135deg,rgba(255,248,200,0.5),rgba(255,240,160,0.3));border:1px solid rgba(196,144,16,0.25);margin-bottom:10px;box-shadow:var(--sh)}
+.obj-result-hd{font-size:13px;font-weight:800;color:#7a5a00;margin-bottom:10px;font-family:'Outfit'}
+.obj-result-row{margin-bottom:8px}
+.obj-result-row:last-child{margin-bottom:0}
+.obj-result-name{font-size:12px;font-weight:700;color:var(--text2);margin-bottom:4px}
+.obj-result-chips{display:flex;flex-wrap:wrap;gap:4px}
+
+/* ── CollView ─────────── */
+.cv{margin-top:10px}
+.cvt{display:flex;align-items:center;gap:6px;padding:10px 13px;background:rgba(255,255,255,0.42);border-radius:var(--rs);cursor:pointer;font-size:12px;font-weight:600;color:var(--text2);border:1px solid var(--border-hi);width:100%;justify-content:center;transition:background 0.12s;-webkit-tap-highlight-color:transparent}
+.cvt:active{background:rgba(255,255,255,0.75)}
+.cvp{margin-top:6px;background:var(--surface-hi);border-radius:var(--rs);padding:12px;box-shadow:var(--sh);border:1px solid var(--border)}
+.cvpl{margin-bottom:12px}.cvpl:last-child{margin-bottom:0}
+.cvph{display:flex;align-items:center;gap:6px;margin-bottom:4px;font-size:12px;font-weight:700}
+.cvps{font-size:11px;color:var(--text3);font-weight:600;margin-left:auto;display:flex;align-items:center;gap:3px}
+.cvcs{display:flex;flex-wrap:wrap;gap:3px}
+.cvmi{width:28px;height:28px;border-radius:7px;display:flex;align-items:center;justify-content:center;position:relative}
+.cvmp{position:absolute;bottom:0;right:0;font-size:7px;background:rgba(0,0,0,0.32);border-radius:3px;padding:0 2px;line-height:1.4;color:#fff}
+.cve{font-size:11px;color:var(--text3);font-style:italic}
+
+/* ── Modal ─────────── */
+.mov{position:fixed;inset:0;background:rgba(5,15,35,0.55);z-index:300;display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(8px)}
+.mob{background:#fff;border-radius:22px;padding:26px 22px;max-width:340px;width:100%;box-shadow:0 24px 64px rgba(0,0,0,0.25);text-align:center}
+.mot{font-size:19px;font-weight:800;margin-bottom:8px;font-family:'Outfit'}
+.mod{font-size:14px;color:var(--text2);margin-bottom:20px;line-height:1.55}
+
+/* ── Rules ─────────── */
+.rs{margin-bottom:14px}
+.rs h3{font-size:14px;font-weight:800;margin-bottom:5px;color:var(--accent);font-family:'Outfit'}
+.rs p,.rs li{font-size:13px;line-height:1.75;color:var(--text)}.rs ul{padding-left:18px}
+.rs .warn{background:rgba(208,56,88,0.07);border:1px solid rgba(208,56,88,0.2);border-radius:8px;padding:8px 11px;margin-top:6px;font-size:12.5px;color:#a02040;font-weight:600}
+.rules-sheet{position:fixed;inset:0;z-index:200;display:flex;flex-direction:column;background:rgba(5,15,35,0.52);backdrop-filter:blur(7px)}
+.rules-inner{margin-top:auto;background:#fff;border-radius:22px 22px 0 0;padding:20px 18px;padding-bottom:calc(env(safe-area-inset-bottom,20px) + 20px);max-height:82dvh;overflow-y:auto;box-shadow:0 -10px 48px rgba(0,0,0,0.2)}
+.rules-handle{width:40px;height:4px;background:#d0dae6;border-radius:2px;margin:0 auto 16px;display:block}
+.scy{overflow-y:auto;max-height:68dvh;padding-right:2px}
+
+/* ── Bid header ─────── */
+.sh{text-align:center;padding:15px 16px;background:var(--surface-hi);border-radius:var(--r);margin-bottom:12px;box-shadow:var(--sh2);border:1px solid rgba(190,215,240,0.7)}
+.shn{font-size:21px;font-weight:900;font-family:'Outfit'}
+.shw{font-size:12px;color:var(--accent2);font-weight:700;margin-top:3px;letter-spacing:0.02em}
+.shc{font-size:13px;color:var(--text2);margin-top:6px;font-weight:600;display:flex;align-items:center;justify-content:center;gap:4px}
+
+/* ── Handoff ─────────── */
+.ho{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:80dvh;text-align:center;padding:24px}
+
+/* ── Coin note ─────── */
+.cnote{background:linear-gradient(135deg,rgba(196,144,16,0.1),rgba(196,144,16,0.04));border:1px solid rgba(196,144,16,0.22);border-radius:var(--rs);padding:9px 13px;margin-bottom:12px;text-align:center;font-size:12.5px;font-weight:700;color:#7a5a00;display:flex;align-items:center;justify-content:center;gap:5px}
+
+/* ── Title ─────────── */
+.ts{display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:90dvh;text-align:center;position:relative;z-index:1;padding:24px}
+.tl{font-family:'Outfit';font-size:42px;font-weight:900;background:linear-gradient(135deg,#2c72d8 15%,#7744bb 55%,#d03858);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;margin-bottom:2px;letter-spacing:-1px;line-height:1.04}
+.tsub{font-size:14px;color:var(--text2);margin-bottom:44px;font-weight:600;letter-spacing:0.1em}
+.tbub{margin-bottom:16px;animation:gb 3.5s ease-in-out infinite}
+@keyframes gb{0%,100%{transform:translateY(0)}50%{transform:translateY(-13px)}}
+.mkt-lbl{margin-bottom:10px;font-weight:700;font-size:13.5px;display:flex;align-items:center;gap:6px;color:var(--text2)}
+
+/* ── Animations ─────── */
+@keyframes fi{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.fi{animation:fi 0.28s ease-out}
+@keyframes winnerIn{0%{opacity:0;transform:scale(0.92)}100%{opacity:1;transform:scale(1)}}
+.winner-in{animation:winnerIn 0.4s cubic-bezier(0.34,1.4,0.64,1)}
+`;
+
+// ── AmbientBg ─────────────────────────────────────────────────────────────────
+function AmbientBg(){
+  const bubbles=useRef(Array.from({length:10},(_,i)=>({id:i,left:Math.random()*100,sz:16+Math.random()*48,dur:14+Math.random()*16,del:Math.random()*14})));
+  return(<>
+    <div className="ambient">
+      <div className="amb-orb" style={{width:340,height:340,top:'-12%',left:'-18%',background:'radial-gradient(circle,rgba(44,114,216,0.45),transparent)',animationDelay:'0s'}}/>
+      <div className="amb-orb" style={{width:280,height:280,bottom:'-6%',right:'-12%',background:'radial-gradient(circle,rgba(136,85,204,0.38),transparent)',animationDelay:'-7s'}}/>
+      <div className="amb-orb" style={{width:210,height:210,top:'42%',right:'22%',background:'radial-gradient(circle,rgba(208,56,88,0.2),transparent)',animationDelay:'-14s'}}/>
+    </div>
+    <div className="bub-bg">{bubbles.current.map(b=><div key={b.id} className="bub-f" style={{left:`${b.left}%`,width:b.sz,height:b.sz,animationDuration:`${b.dur}s`,animationDelay:`${b.del}s`}}/>)}</div>
+  </>);
+}
+
+// ── BCard ─────────────────────────────────────────────────────────────────────
+function BCard({card,children,extraClass=""}){
+  return(
+    <div className={`bcard ${extraClass}`} style={{background:`linear-gradient(155deg,${COLOR_HEX_L[card.color]} 0%,#f0f6ff 70%,${COLOR_HEX[card.color]}0f 100%)`}}>
+      <div className="bcard-row">
+        <div className="bcard-ic"><SvgKind kind={card.kind} size={27}/></div>
+        <div className="bcard-inf">
+          <span className="bcard-tag" style={{background:COLOR_HEX[card.color]}}>{COLOR_LABELS[card.color]}</span>
+          <div className="bcard-kn">{KIND_LABELS[card.kind]}</div>
+        </div>
+        <div className="bcard-pt">{card.basePoints}<small>pt</small></div>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+// ── BidValueDisplay ────────────────────────────────────────────────────────────
+function BidValueDisplay({value}){
+  const [key,setKey]=useState(0);
+  const prev=useRef(value);
+  useEffect(()=>{if(value!==prev.current){setKey(k=>k+1);prev.current=value;};},[value]);
+  return <div key={key} className="bid-val pop" style={{color:value>0?'var(--accent)':'var(--text)'}}>{value}</div>;
+}
+
+// ── CollView ──────────────────────────────────────────────────────────────────
+function CollView({players}){
+  const [open,setOpen]=useState(false);
+  return(
+    <div className="cv">
+      <button className="cvt" onClick={()=>setOpen(!open)} aria-expanded={open}><SvgEye/> 全プレイヤーの獲得状況 <SvgChev up={open}/></button>
+      {open&&<div className="cvp fi">{players.map(p=>{
+        const sc=calcScore(p.collected);
+        return(<div key={p.id} className="cvpl">
+          <div className="cvph"><div style={{width:10,height:10,borderRadius:'50%',background:PL_C[p.ci],flexShrink:0}}/><span style={{color:PL_AC[p.ci]}}>{p.name}</span><span className="cvps"><SvgCoin size={13}/>{p.coins} | {sc.total}pt</span></div>
+          {p.collected.length===0?<div className="cve">まだカードなし</div>:
+          <div className="cvcs">{p.collected.map((c,j)=><div key={j} className="cvmi" style={{background:COLOR_HEX[c.color]}} title={`${COLOR_LABELS[c.color]} ${KIND_LABELS[c.kind]} ${c.basePoints}pt`}><SvgKind kind={c.kind} size={14}/><span className="cvmp">{c.basePoints}</span></div>)}</div>}
+        </div>);
+      })}</div>}
+    </div>
+  );
+}
+
+// ── PBar ──────────────────────────────────────────────────────────────────────
+function PBar({players}){
+  return(
+    <div className="pbar">{players.map(p=>(
+      <div key={p.id} className="pchip" style={{borderColor:PL_C[p.ci]+'44'}}>
+        <div className="pchip-n" style={{color:PL_AC[p.ci]}}>{p.name}</div>
+        <div className="pchip-c"><SvgCoin size={14}/>{p.coins}</div>
+        <div className="pchip-k">{p.collected.length}枚</div>
+        <div className="cdots">{p.collected.slice(-10).map((c,j)=><div key={j} className="cdot" style={{background:COLOR_HEX[c.color]}}/>)}</div>
+      </div>
+    ))}</div>
+  );
+}
+
+// ── ObjectivesBar ─────────────────────────────────────────────────────────────
+function ObjectivesBar({objectives,players}){
+  const [openIdx,setOpenIdx]=useState(null);
+  return(
+    <div>
+      <div className="obj-bar">
+        {objectives.map((obj,i)=>(
+          <div key={obj.id} className="obj-chip" onClick={()=>setOpenIdx(openIdx===i?null:i)}>
+            <div className="obj-chip-hd"><span>{obj.icon}</span><span>{obj.short}</span><SvgChev up={openIdx===i}/></div>
+            <div className="obj-chip-sub">{obj.kind==='competitive'?'争奪型':'達成型'}</div>
+          </div>
+        ))}
+      </div>
+      {openIdx!==null&&(
+        <div className="obj-detail fi">
+          <div>
+            <span className={`obj-kind-badge ${objectives[openIdx].kind==='competitive'?'obj-kind-comp':'obj-kind-ach'}`}>
+              {objectives[openIdx].kind==='competitive'?'⚔ 争奪型':'✓ 達成型'}
+            </span>
+          </div>
+          <div style={{fontSize:13,fontWeight:700,marginBottom:4,color:'var(--text)'}}>{objectives[openIdx].label}</div>
+          <div style={{fontSize:12,color:'var(--text2)',lineHeight:1.6}}>{objectives[openIdx].desc}</div>
+          {objectives[openIdx].kind==='competitive'&&players&&(
+            <div className="obj-pts-row">
+              {players.map(p=>{
+                const cur=objectives[openIdx].calc(p,players);
+                return cur>0?<span key={p.id} className="obj-pl-pt" style={{background:PL_BG[p.ci],color:PL_AC[p.ci]}}>{p.name}: +{cur}pt</span>:null;
+              })}
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── DeckStatsPanel ────────────────────────────────────────────────────────────
+// Shows how many of each color/kind have been publicly revealed (past rounds + current market)
+function DeckStatsPanel({revealedCards, market}){
+  const [open,setOpen]=useState(false);
+  // Visible = already-revealed past cards + current market
+  const visible = [...revealedCards, ...market];
+  const {colorCount, kindCount, totalVisible} = calcDeckStats(visible);
+  const remaining = DECK_SIZE - totalVisible;
+
+  return(
+    <>
+      <button className="ds-toggle" onClick={()=>setOpen(!open)}>
+        <SvgEye/> デッキ統計 （公開済み {totalVisible}/{DECK_SIZE} | 山札残り {remaining}）
+        <SvgChev up={open} style={{marginLeft:'auto'}}/>
+      </button>
+      {open&&(
+        <div className="ds-body fi">
+          <div className="ds-section">
+            <div className="ds-hd">色ごと（{PER_COLOR}枚中）</div>
+            <div className="ds-grid">
+              {COLORS.map(c=>{
+                const n=colorCount[c]; const full=n>=PER_COLOR;
+                return(
+                  <span key={c} className={`ds-chip ${full?'ds-chip-full':''}`}
+                    style={{background:COLOR_HEX_L[c],color:PL_AC[COLORS.indexOf(c)%4]||'#333',borderColor:COLOR_HEX[c]+'44'}}>
+                    {COLOR_LABELS[c]} {n}/{PER_COLOR}
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+          <div className="ds-section">
+            <div className="ds-hd">種類ごと（{PER_KIND}枚中）</div>
+            <div className="ds-grid">
+              {KINDS.map(k=>{
+                const n=kindCount[k]; const full=n>=PER_KIND;
+                return(
+                  <span key={k} className={`ds-chip ${full?'ds-chip-full':''}`}
+                    style={{background:'rgba(255,255,255,0.7)',color:'var(--text2)',borderColor:'var(--border-hi)'}}>
+                    <SvgKind kind={k} size={12}/>{KIND_LABELS[k]} {n}/{PER_KIND}
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+          <div style={{fontSize:11,color:'var(--text3)',marginTop:6}}>
+            ※ 色・種類別の「残り枚数」は表示しません（記憶・推理の楽しさを残すため）
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+// ── HistoryPanel ──────────────────────────────────────────────────────────────
+function HistoryPanel({history,players}){
+  const [open,setOpen]=useState(false);
+  if(!history||history.length===0) return null;
+  return(
+    <>
+      <button className="hist-toggle" onClick={()=>setOpen(!open)}><SvgEye/> 公開済みカード履歴（{history.length}ラウンド）<SvgChev up={open}/></button>
+      {open&&(
+        <div className="hist-body fi">
+          {history.map((rv,ri)=>(
+            <div key={ri} className="hist-round">
+              <div className="hist-rnd-hd" style={{display:'flex',alignItems:'center',gap:5}}>
+                ROUND {ri+1}
+                {/* Show ability icons used that round */}
+                {rv.abilityLog?.length>0&&rv.abilityLog.map((al,ai)=>{
+                  const ab=findAbility(al.type);
+                  const pl=players.find(p=>p.id===al.pid);
+                  return ab&&pl?<span key={ai} title={`${pl.name}: ${ab.label}`} style={{fontSize:13}}>{ab.icon}</span>:null;
+                })}
+              </div>
+              <div className="hist-cards">
+                {rv.cards.map((card,ci)=>{
+                  const w=rv.winners[ci];
+                  const winner=w&&w!=='tie-pop'&&w!=='dummy'?players.find(p=>p.id===w):null;
+                  const label=w==='tie-pop'?'割れ':w==='dummy'?'番人':winner?winner.name.slice(0,3):'−';
+                  const bg=winner?PL_C[winner.ci]:w==='tie-pop'?'#d03858':w==='dummy'?'#888':COLOR_HEX[card.color];
+                  return(
+                    <span key={card.id} className="hist-card" style={{background:bg+'dd'}}>
+                      <SvgKind kind={card.kind} size={12}/>{COLOR_LABELS[card.color]} {card.basePoints}pt {label}
+                    </span>
+                  );
+                })}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+    </>
+  );
+}
+
+// ── AbilitySelector ───────────────────────────────────────────────────────────
+// Improvements: closing the panel no longer resets selection; explicit "使わない" option.
+function AbilitySelector({player,round,market,onAbilityChange}){
+  const isFirstHalf = round<=4;
+  const alreadyUsed = isFirstHalf ? player.abilityUsedFirst : player.abilityUsedSecond;
+  const halfLabel   = isFirstHalf ? '前半' : '後半';
+  const [open,setOpen] = useState(false);
+  // null = not yet chosen, "none" = explicitly skip, string = ability id
+  const [sel,setSel] = useState(null);
+  const [targetIdx,setTargetIdx] = useState(0);
+
+  // Notify parent whenever selection or target changes
+  useEffect(()=>{
+    const ab = sel && sel !== "none"
+      ? { type:sel, cardIdx: sel==='shield' ? targetIdx : undefined }
+      : null;
+    onAbilityChange(ab);
+  },[sel, targetIdx, onAbilityChange]);
+
+  if(alreadyUsed){
+    const usedType = isFirstHalf ? player.abilityUsedFirstType : player.abilityUsedSecondType;
+    const ab = findAbility(usedType);
+    return(
+      <div style={{marginTop:8,marginBottom:8}}>
+        <span className="abl-used">{halfLabel}能力：{ab?.icon}{ab?.label} 使用済み</span>
+      </div>
+    );
+  }
+
+  const selLabel = sel==="none" ? "使わない" : sel ? `${findAbility(sel)?.icon} ${findAbility(sel)?.label} を使用` : null;
+
+  return(
+    <div style={{marginTop:8,marginBottom:8}}>
+      {/* Toggle row – closing does NOT reset selection */}
+      <div
+        className={`abl-toggle ${(open||(sel&&sel!=="none"))?'active':''}`}
+        onClick={()=>setOpen(v=>!v)}
+      >
+        <span>{selLabel ?? `⚡ ${halfLabel}特殊能力を使う（残1回）`}</span>
+        <SvgChev up={open}/>
+      </div>
+
+      {open&&(
+        <div className="fi">
+          <div className="abl-grid">
+            {/* "使わない" card */}
+            <div
+              className={`abl-card ${sel==="none"?'none-sel':''}`}
+              onClick={()=>setSel(sel==="none"?null:"none")}
+            >
+              <div className="abl-icon">🚫</div>
+              <div className="abl-name">使わない</div>
+              <div className="abl-desc">能力を温存する（残1回は次の半で使える）</div>
+            </div>
+            {ABILITIES.map(ab=>(
+              <div
+                key={ab.id}
+                className={`abl-card ${sel===ab.id?'sel':''}`}
+                onClick={()=>setSel(sel===ab.id?null:ab.id)}
+              >
+                <div className="abl-icon">{ab.icon}</div>
+                <div className="abl-name">{ab.label}</div>
+                <div className="abl-desc">{ab.desc}</div>
+              </div>
+            ))}
+          </div>
+          {sel==='shield'&&(
+            <div style={{marginTop:7}}>
+              <div style={{fontSize:11.5,fontWeight:700,color:'var(--text2)',marginBottom:5}}>保護するカードを選ぶ</div>
+              <div className="abl-target">
+                {market.map((card,i)=>(
+                  <div key={card.id} className={`abl-tcard ${targetIdx===i?'sel':''}`} onClick={()=>setTargetIdx(i)}>
+                    <div style={{fontSize:9}}>{COLOR_LABELS[card.color]}</div>
+                    <SvgKind kind={card.kind} size={16}/>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── QuitModal ─────────────────────────────────────────────────────────────────
+function QuitModal({onQuit,onCancel,onResult}){
+  return(
+    <div className="mov" onClick={onCancel}>
+      <div className="mob fi" onClick={e=>e.stopPropagation()}>
+        <div className="mot">ゲームを終了しますか？</div>
+        <div className="mod">現在の状態でスコアを計算して結果を見るか、タイトルに戻れます。</div>
+        <div style={{display:'flex',flexDirection:'column',gap:8}}>
+          <button className="btn btn-g btn-f" onClick={onResult}>現時点の結果を見る</button>
+          <button className="btn btn-d btn-f btn-sm" onClick={onQuit}>タイトルへ戻る</button>
+          <button className="btn btn-s btn-f btn-sm" onClick={onCancel}>キャンセル</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── RulesContent ──────────────────────────────────────────────────────────────
+function RulesContent(){
+  return(<>
+    <div className="rs"><h3>ゲームの流れ</h3><p>{MAX_ROUNDS}ラウンドで泡に包まれたカードを競り落とし、色や種類のセットと公開目標を達成して得点を競います。スマホを順番に回す秘密入札ゲームです。</p></div>
+    <div className="rs"><h3>有限デッキ（{DECK_SIZE}枚）</h3><p>デッキは全{DECK_SIZE}枚（5色×5種+5枚追加）。ゲーム開始時にシャッフルして山札を作成。毎ラウンド3枚ずつ公開します。ヘッダーの「山札残り」は次ラウンド以降に引ける枚数です。</p></div>
+    <div className="rs"><h3>コインと入札上限</h3><p>初期コイン{START_COINS}枚。ラウンド2以降は毎ラウンド全員に＋1枚。各ラウンド最大{MAX_BID}枚まで3枚のカードに自由配分して入札。落札分のみ消費します。</p></div>
+    <div className="rs"><h3>落札ルール</h3><p>各カードで最高入札者が落札し入札額を支払います。</p>
+      <div className="warn">⚠ 同点→「泡が割れた！」同点になったプレイヤー全員が<strong>1コイン失います</strong>（下限0）。カードは消滅。</div>
+    </div>
+    <div className="rs"><h3>得点計算</h3><ul><li>カードの基本点の合計</li><li>同じ色3枚ごとに+4点</li><li>同じ種類2枚ごとに+3点</li><li>5色すべて揃えたら+6点</li><li>＋公開目標ボーナス</li></ul></div>
+    <div className="rs"><h3>順位判定</h3><p>総合得点（基本点＋セットボーナス＋目標ボーナス）が高い順。同点の場合は残コインが多い方が上位。それも同じなら所持カード枚数が多い方が上位。それも同じなら同順位（同率）。</p></div>
+    <div className="rs"><h3>公開目標（2種）</h3><p>ゲーム開始時に「争奪型（最多を競う）」と「達成型（条件クリア）」の目標がランダムに決まります。全員共通で終了時に得点加算されます。</p></div>
+    <div className="rs"><h3>特殊能力（前半1回・後半1回）</h3><p>R1〜R4で1回、R5〜R8で1回、入札時に特殊能力を使用できます。能力は⚡強気入札・🫧泡膜保護・✂️値切り・💧温存回収の4種から選べます。持ち越し不可。</p></div>
+    <div className="rs"><h3>2人プレイ：市場の番人</h3><p>「市場の番人」が各カードにランダムで自動入札（合計2〜5コイン、各カード最大3）。番人落札カードは消滅。番人との同点も実プレイヤーは-1コイン。</p></div>
+  </>);
+}
+
+// ── RulesSheet ────────────────────────────────────────────────────────────────
+function RulesSheet({onClose}){
+  return(
+    <div className="rules-sheet" onClick={onClose}>
+      <div className="rules-inner fi" onClick={e=>e.stopPropagation()}>
+        <span className="rules-handle"/>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:14}}>
+          <h2 className="fd" style={{fontSize:17,fontWeight:800}}>ルール確認</h2>
+          <button className="icon-btn" onClick={onClose} aria-label="閉じる" style={{fontSize:18,fontWeight:700,color:'var(--text2)'}}>✕</button>
+        </div>
+        <div className="scy"><RulesContent/></div>
+      </div>
+    </div>
+  );
+}
+
+// ── GameHeader ────────────────────────────────────────────────────────────────
+function GameHeader({game,isOn,onToggleBgm,onQuit,onRules,showExit=true}){
+  // deckLeft = cards still in the draw pile (not yet dealt as market)
+  const deckLeft = game.deck ? game.deck.length : 0;
+  return(
+    <div className="hdr">
+      <div className="hdr-left">
+        <span className="rbg">R{game.round}/{MAX_ROUNDS}</span>
+        {game.round>1&&<span className="cinc"><SvgCoin size={11}/>+1</span>}
+        <span className="deck-badge" title="山札残り枚数（次ラウンド以降に引ける枚数）">🃏山札 {deckLeft}</span>
+      </div>
+      <div className="hdr-right">
+        <button className="icon-btn" onClick={onRules} aria-label="ルール確認"><SvgInfo/></button>
+        <button className="icon-btn" onClick={onToggleBgm} aria-label={isOn?"BGMをオフ":"BGMをオン"}>{isOn?<SvgMusicOn/>:<SvgMusicOff/>}</button>
+        {showExit&&onQuit&&<button className="icon-btn danger" onClick={onQuit} aria-label="ゲームを終了する"><SvgExit/></button>}
+      </div>
+    </div>
+  );
+}
+
+// ── TitleScr ──────────────────────────────────────────────────────────────────
+function TitleScr({onStart,onRules,isOn,onToggleBgm}){
+  return(
+    <div className="ts fi">
+      <div style={{position:'absolute',top:'calc(env(safe-area-inset-top,0px) + 12px)',right:16}}>
+        <button className="icon-btn" onClick={onToggleBgm} aria-label={isOn?"BGMをオフ":"BGMをオン"}>{isOn?<SvgMusicOn/>:<SvgMusicOff/>}</button>
+      </div>
+      <div className="tbub"><SvgBubble size={80} color="#2c72d8"/></div>
+      <div className="tl fd">Bubble Bazaar</div>
+      <div className="tsub">泡の競り市</div>
+      <div style={{display:'flex',flexDirection:'column',gap:10,width:'100%',maxWidth:320}}>
+        <button className="btn btn-p btn-f" onClick={onStart}>はじめる</button>
+        <button className="btn btn-s btn-f" onClick={onRules}>ルール</button>
+      </div>
+    </div>
+  );
+}
+
+// ── RulesScr ──────────────────────────────────────────────────────────────────
+function RulesScr({onBack}){
+  return(
+    <div className="fi scr" style={{paddingTop:16}}>
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:16}}>
+        <button className="btn btn-sm btn-s" onClick={onBack}>← 戻る</button>
+        <h2 className="fd" style={{fontSize:18,fontWeight:800}}>ルール</h2>
+      </div>
+      <div className="panel scy" style={{maxHeight:'78dvh'}}><RulesContent/></div>
+    </div>
+  );
+}
+
+// ── SetupScr ──────────────────────────────────────────────────────────────────
+function SetupScr({onStart,onBack}){
+  const [cnt,setCnt]=useState(2);
+  const [nms,setNms]=useState(["","","",""]);
+  return(
+    <div className="fi scr" style={{paddingTop:16}}>
+      <div style={{display:'flex',alignItems:'center',gap:8,marginBottom:16}}>
+        <button className="btn btn-sm btn-s" onClick={onBack}>← 戻る</button>
+        <h2 className="fd" style={{fontSize:18,fontWeight:800}}>プレイヤー設定</h2>
+      </div>
+      <div className="panel" style={{marginBottom:14}}>
+        <div style={{textAlign:'center',fontWeight:700,fontSize:13,marginBottom:2,color:'var(--text2)'}}>人数</div>
+        <div className="csel">{[2,3,4].map(n=><button key={n} className={`cbtn ${cnt===n?'on':''}`} onClick={()=>setCnt(n)}>{n}</button>)}</div>
+        {cnt===2&&<div style={{textAlign:'center',fontSize:11.5,color:'var(--text3)',marginTop:2}}>市場の番人が参加します</div>}
+      </div>
+      <div className="panel" style={{marginBottom:14}}>
+        {Array.from({length:cnt},(_,i)=>(
+          <div key={i} className="srow">
+            <div className="sdot" style={{background:PL_C[i]}}>{i+1}</div>
+            <input className="sinp" placeholder={`Player ${i+1}`} value={nms[i]} onChange={e=>{const n=[...nms];n[i]=e.target.value;setNms(n);}} maxLength={12}/>
+          </div>
+        ))}
+      </div>
+      <button className="btn btn-p btn-f" onClick={()=>onStart(cnt,nms.slice(0,cnt))}>ゲーム開始</button>
+    </div>
+  );
+}
+
+// ── MarketScr ─────────────────────────────────────────────────────────────────
+function MarketScr({game,onBid,onQuit,isOn,onToggleBgm,onRules}){
+  const isFirst = game.round===1;
+  return(
+    <div className="fi" style={{position:'relative',zIndex:1}}>
+      <GameHeader game={game} isOn={isOn} onToggleBgm={onToggleBgm} onQuit={onQuit} onRules={onRules}/>
+      <div className="scr">
+        {!isFirst&&<div className="cnote"><SvgCoin size={15}/>全員にコイン+1が配られました</div>}
+        <PBar players={game.players}/>
+        <ObjectivesBar objectives={game.objectives} players={game.players}/>
+        <DeckStatsPanel revealedCards={game.revealedCards} market={game.market}/>
+        {game.history.length>0&&<HistoryPanel history={game.history} players={game.players}/>}
+        <div className="mkt-lbl"><SvgBubble size={20} color="#2c72d8"/> 今回の市場 <span style={{marginLeft:'auto',fontSize:11,color:'var(--text3)',fontWeight:600}}>上限{MAX_BID}コイン</span></div>
+        <div style={{display:'flex',flexDirection:'column',gap:9,marginBottom:18}}>
+          {game.market.map(c=><BCard key={c.id} card={c}/>)}
+        </div>
+        <button className="btn btn-p btn-f" onClick={onBid}>秘密入札を開始</button>
+      </div>
+    </div>
+  );
+}
+
+// ── BidScr ────────────────────────────────────────────────────────────────────
+function BidScr({game,player,onConfirm,sfx,isOn,onToggleBgm,onRules,onQuit,showExit=false}){
+  const [al,setAl] = useState([0,0,0]);
+  const [ability,setAbility] = useState(null);
+  // Keep a ref so the confirm callback always has the latest ability value
+  const abilityRef = useRef(null);
+
+  const handleAbilityChange = useCallback((ab)=>{
+    abilityRef.current = ab;
+    setAbility(ab);
+  },[]);
+
+  const effectiveMx = ability?.type==='aggressive'
+    ? Math.min(7, player.coins)
+    : Math.min(MAX_BID, player.coins);
+
+  const tot = al.reduce((a,b)=>a+b, 0);
+
+  const adj = (i,d) => {
+    const na = [...al]; const nv = na[i]+d;
+    if (nv < 0 || tot+d > effectiveMx) return;
+    na[i] = nv; setAl(na);
+    if (d > 0) sfx("coin");
+  };
+
+  return(
+    <div className="fi" style={{position:'relative',zIndex:1}}>
+      <GameHeader game={game} isOn={isOn} onToggleBgm={onToggleBgm} onQuit={onQuit} onRules={onRules} showExit={showExit}/>
+      <div className="scr">
+        <div className="sh">
+          <div className="shn" style={{color:PL_C[player.ci]}}>{player.name} の入札</div>
+          <div className="shw">⚠ 他の人は見ないでください</div>
+          <div className="shc"><SvgCoin size={16}/>残り {player.coins}　|　上限 {effectiveMx}</div>
+        </div>
+        <div style={{display:'flex',flexDirection:'column',gap:9,marginBottom:10}}>
+          {game.market.map((card,i)=>(
+            <BCard key={card.id} card={card}>
+              <div className="bid-row">
+                <button className="bid-btn" disabled={al[i]<=0} onClick={()=>adj(i,-1)} aria-label="入札を減らす">−</button>
+                <BidValueDisplay value={al[i]}/>
+                <button className="bid-btn" disabled={tot>=effectiveMx} onClick={()=>adj(i,+1)} aria-label="入札を増やす">+</button>
+                <SvgCoin size={19}/>
+              </div>
+            </BCard>
+          ))}
+        </div>
+        <div className="bid-total" style={{color:tot>0?'var(--accent)':'var(--text3)'}}>
+          合計 {tot} / {effectiveMx} <SvgCoin size={18}/>
+        </div>
+        <AbilitySelector player={player} round={game.round} market={game.market} onAbilityChange={handleAbilityChange}/>
+        <CollView players={game.players}/>
+        <div style={{marginTop:14}}>
+          <button className="btn btn-g btn-f" onClick={()=>{sfx("bid");onConfirm(al, abilityRef.current);}}>確定する ✓</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── HandoffScr ────────────────────────────────────────────────────────────────
+function HandoffScr({nextName,isLast,onNext,isOn,onToggleBgm,game,onRules,onQuit,showExit=false}){
+  return(
+    <div className="fi" style={{position:'relative',zIndex:1}}>
+      <GameHeader game={game} isOn={isOn} onToggleBgm={onToggleBgm} onQuit={onQuit} onRules={onRules} showExit={showExit}/>
+      <div className="ho">
+        <SvgBubble size={88} color="#35a970"/>
+        <div style={{fontSize:18,fontWeight:700,marginTop:16,marginBottom:7,fontFamily:"'Outfit'"}}>入力を保存しました</div>
+        <div style={{fontSize:14,color:'var(--text2)',marginBottom:34,maxWidth:260}}>
+          {isLast?"全員の入札が完了しました":`画面を隠して ${nextName} に渡してください`}
+        </div>
+        <button className="btn btn-p" style={{minWidth:200}} onClick={onNext}>{isLast?"結果を公開":"次へ →"}</button>
+      </div>
+    </div>
+  );
+}
+
+// ── RevealScr ─────────────────────────────────────────────────────────────────
+function RevealScr({game,onNext,sfx,isOn,onToggleBgm,onRules,onQuit}){
+  const r = game.reveal;
+  const isLastRound = game.round >= MAX_ROUNDS;
+  const sfxRef = useRef(sfx);
+  useEffect(()=>{sfxRef.current=sfx;},[sfx]);
+  useEffect(()=>{
+    if(!r) return;
+    const ids=[];
+    if(r.winners.some(w=>w==='tie-pop')) ids.push(setTimeout(()=>sfxRef.current("pop"),200));
+    if(r.winners.some(w=>w&&w!=='tie-pop'&&w!=='dummy')) ids.push(setTimeout(()=>sfxRef.current("win"),400));
+    return()=>ids.forEach(clearTimeout);
+  },[r]);
+  if(!r) return null;
+
+  return(
+    <div className="fi" style={{position:'relative',zIndex:1}}>
+      <GameHeader game={game} isOn={isOn} onToggleBgm={onToggleBgm} onQuit={onQuit} onRules={onRules} showExit={true}/>
+      <div className="scr">
+        <div style={{textAlign:'center',marginBottom:14}}><span className="rbg">Round {game.round} 結果</span></div>
+        {r.cards.map((card,ci)=>{
+          const w = r.winners[ci];
+          const {penaltyPids=[], shieldedPids=[], maxBid=0} = r.cardResults?.[ci]||{};
+          const isTie = w==='tie-pop', isNone = w===null, isDummy = w==='dummy';
+          const penaltyNames = penaltyPids.map(pid=>game.players.find(p=>p.id===pid)?.name).filter(Boolean);
+          const shieldNames  = shieldedPids.map(pid=>game.players.find(p=>p.id===pid)?.name).filter(Boolean);
+          const extraClass = ['rvc-a', isTie?'rvc-pop':'', (!isTie&&!isNone&&!isDummy)?'rvc-win':''].join(' ');
+          return(
+            <div key={card.id} className={`rvc ${extraClass}`} style={{animationDelay:`${ci*0.08}s`}}>
+              <BCard card={card}/>
+              <div className="rvb">
+                {r.bids.map(bid=>{
+                  const pl = game.players.find(p=>p.id===bid.pid);
+                  const isTop = bid.al[ci]===maxBid && maxBid>0;
+                  const abilityInfo = bid.ability ? findAbility(bid.ability.type) : null;
+                  return(
+                    <span key={bid.pid} className="rvch"
+                      style={{background:PL_BG[pl.ci],color:PL_AC[pl.ci],border:`1px solid ${PL_C[pl.ci]}${isTop?'66':'22'}`,fontWeight:isTop?800:600}}>
+                      {pl.name}: {bid.al[ci]}<SvgCoin size={11}/>
+                      {abilityInfo&&<span title={abilityInfo.desc}>{abilityInfo.icon}</span>}
+                    </span>
+                  );
+                })}
+                {r.dummy&&<span className="rvch" style={{background:'#f0f3f6',color:'#6b7a88',border:'1px solid #dde2e8'}}>番人: {r.dummy[ci]}<SvgCoin size={11}/></span>}
+              </div>
+              <div className={`rvw ${isTie?'rvw-p':isNone||isDummy?'rvw-n':'rvw-g'}`}>
+                {isTie
+                  ?<><SvgPop size={20}/>泡が割れた！
+                    {penaltyNames.length>0&&<span style={{fontSize:12,marginLeft:4}}>（{penaltyNames.join('・')} −1<SvgCoin size={11}/>）</span>}
+                    {shieldNames.length>0&&<span style={{fontSize:12,marginLeft:4}}>🫧{shieldNames.join('・')} 保護</span>}
+                  </>
+                  :isDummy?<>番人が獲得（得点なし）</>
+                  :isNone?<>— 入札なし —</>
+                  :<>{game.players.find(p=>p.id===w)?.name} が落札！</>}
+              </div>
+            </div>
+          );
+        })}
+
+        {/* Ability effect log */}
+        {r.abilityLog?.length>0&&(
+          <div className="rv-abl-log fi">
+            <div style={{fontSize:11.5,fontWeight:800,color:'var(--text2)',marginBottom:2}}>⚡ 特殊能力の効果</div>
+            {r.abilityLog.map((al,idx)=>{
+              const pl = game.players.find(p=>p.id===al.pid);
+              const ab = findAbility(al.type);
+              if(!pl||!ab) return null;
+              const triggered = al.effectLabel && !al.effectLabel.startsWith('発動なし');
+              return(
+                <div key={idx} className="rv-abl-row">
+                  <span className="rv-abl-name">{pl.name}</span>
+                  <span className={`abl-effect ${triggered?'triggered':'no-trigger'}`}>
+                    {ab.icon} {ab.label}
+                  </span>
+                  <span style={{fontSize:11,color:'var(--text2)'}}>{al.effectLabel}</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        <div style={{marginTop:12}}>
+          <button className="btn btn-p btn-f" onClick={onNext}>{isLastRound?"最終結果へ":"次のラウンドへ →"}</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── ResultScr ─────────────────────────────────────────────────────────────────
+function ResultScr({game,onRematch,onSetup,onTitle,early,eRound}){
+  const ranked = rankPlayers(game.players, game.objectives);
+  const winners = ranked.filter(p => p.rank === 1);
+  const rest    = ranked.filter(p => p.rank > 1);
+  const isTied  = winners.length > 1;
+
+  // Info for early-exit banner
+  const playedRounds    = early ? eRound : MAX_ROUNDS;
+  const remainingRounds = MAX_ROUNDS - playedRounds;
+  const unrevealedCards = early ? (game.deck?.length ?? 0) + CARDS_PER_ROUND : 0;
+
+  const ScoreBreakdown = ({p, big}) => {
+    const {base,colorSet,kindSet,rainbow,objBonuses,objTotal,grandTotal} = p.fs;
+    return(
+      <div>
+        <div className={`rpl-sc ${big?'':'rpl-sc-sm'}`} style={{color:PL_C[p.ci]}}>{grandTotal}<small> 点</small></div>
+        <div className="rpl-breakdown">
+          {base>0       &&<span className="rpl-bp">基本 {base}</span>}
+          {colorSet>0   &&<span className="rpl-bp pos">色 +{colorSet}</span>}
+          {kindSet>0    &&<span className="rpl-bp pos">種 +{kindSet}</span>}
+          {rainbow>0    &&<span className="rpl-bp pos">🌈+{rainbow}</span>}
+          {objBonuses.filter(o=>o.bonus>0).map(o=><span key={o.id} className="rpl-bp obj">{o.icon}+{o.bonus}</span>)}
+        </div>
+      </div>
+    );
+  };
+
+  const PlayerMeta = ({p}) => (
+    <>
+      <div style={{fontSize:12.5,color:'var(--text2)',marginTop:5,lineHeight:1.8}}>
+        残コイン <SvgCoin size={13}/>{p.coins}　カード {p.collected.length}枚
+      </div>
+      <div className="cdots" style={{marginTop:5,justifyContent:'flex-start'}}>
+        {p.collected.map((c,j)=>(
+          <div key={j} className="cvmi" style={{background:COLOR_HEX[c.color]}} title={`${COLOR_LABELS[c.color]} ${KIND_LABELS[c.kind]} ${c.basePoints}pt`}>
+            <SvgKind kind={c.kind} size={14}/><span className="cvmp">{c.basePoints}</span>
+          </div>
+        ))}
+      </div>
+      {(p.abilityUsedFirst||p.abilityUsedSecond)&&(
+        <div className="rpl-abl-used">
+          {p.abilityUsedFirst&&<>前半: {findAbility(p.abilityUsedFirstType)?.icon}{findAbility(p.abilityUsedFirstType)?.label}</>}
+          {p.abilityUsedFirst&&p.abilityUsedSecond&&'　'}
+          {p.abilityUsedSecond&&<>後半: {findAbility(p.abilityUsedSecondType)?.icon}{findAbility(p.abilityUsedSecondType)?.label}</>}
+        </div>
+      )}
+    </>
+  );
+
+  return(
+    <div className="fi scr" style={{paddingTop:16}}>
+      <div style={{textAlign:'center',marginBottom:14}}>
+        <SvgCrown size={56}/>
+        <h2 className="fd" style={{fontSize:20,fontWeight:900,marginTop:5}}>
+          {early ? '途中結果（暫定）' : '最終結果'}
+        </h2>
+      </div>
+
+      {/* Early-exit info banner */}
+      {early&&(
+        <div className="early-banner">
+          ⚠ Round {eRound} 終了時点の暫定スコアです。<br/>
+          未消化 {remainingRounds} ラウンド、未公開カード {unrevealedCards} 枚が残っています。<br/>
+          目標ボーナスは現時点の獲得状況で計算されています。
+        </div>
+      )}
+
+      {/* Winner(s) — all rank-1 players get the winner card */}
+      {winners.map((p, wi) => (
+        <div key={p.id} className="rpl-winner winner-in" style={{animationDelay:`${wi*0.08}s`}}>
+          <span className="winner-badge">
+            {isTied ? `👑 同率 ${wi+1}位` : '👑 優勝'}
+          </span>
+          <div className="rpl-nm" style={{color:PL_AC[p.ci]}}><SvgCrown size={22}/>{p.name}</div>
+          <ScoreBreakdown p={p} big={true}/>
+          <PlayerMeta p={p}/>
+        </div>
+      ))}
+
+      {/* 2nd place and below */}
+      {rest.map((p,idx)=>(
+        <div key={p.id} className="rpl fi" style={{background:PL_BG[p.ci],border:`1.5px solid ${PL_C[p.ci]}33`,animationDelay:`${(winners.length+idx)*0.07}s`}}>
+          <div className="rpl-rk fd">#{p.rank}</div>
+          <div className="rpl-nm" style={{color:PL_AC[p.ci]}}>{p.name}</div>
+          <ScoreBreakdown p={p} big={false}/>
+          <PlayerMeta p={p}/>
+        </div>
+      ))}
+
+      {/* Objective results */}
+      <div className="obj-result fi" style={{animationDelay:'0.3s'}}>
+        <div className="obj-result-hd">🎯 公開目標の結果</div>
+        {game.objectives.map(obj=>(
+          <div key={obj.id} className="obj-result-row">
+            <div className="obj-result-name">{obj.icon} {obj.label}</div>
+            <div className="obj-result-chips">
+              {ranked.map(p=>{
+                const pts = obj.calc(p, game.players);
+                return(
+                  <span key={p.id} className="obj-pl-pt"
+                    style={{background:pts>0?PL_BG[p.ci]:'rgba(0,0,0,0.05)',color:pts>0?PL_AC[p.ci]:'var(--text3)',opacity:pts===0?0.6:1}}>
+                    {p.name.slice(0,4)}: {pts>0?`+${pts}pt`:'−'}
+                  </span>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{display:'flex',flexDirection:'column',gap:9,marginTop:16}}>
+        <button className="btn btn-p btn-f" onClick={onRematch}>もう一回（同設定）</button>
+        <button className="btn btn-s btn-f" onClick={onSetup}>設定を変えて再戦</button>
+        <button className="btn btn-gh btn-f" onClick={onTitle}>タイトルへ戻る</button>
+      </div>
+    </div>
+  );
+}
+
+// ── App ───────────────────────────────────────────────────────────────────────
+export default function App(){
+  const [scr,setScr]         = useState("title");
+  const [game,setGame]       = useState(null);
+  const [last,setLast]       = useState(null);
+  const [showQ,setShowQ]     = useState(false);
+  const [showRules,setShowRules] = useState(false);
+  const [early,setEarly]     = useState(null); // null = full game, number = round it was cut short
+  const au = useAudio();
+
+  const goTitle   = () => { setScr("title"); setGame(null); setShowQ(false); setShowRules(false); setEarly(null); };
+  const startGame = (c,n) => { setLast({c,n}); setEarly(null); setGame(initGame(c,n)); setScr("game"); };
+  const rematch   = () => { if(last){ setEarly(null); setGame(initGame(last.c,last.n)); } };
+  const startBid  = () => setGame(g => ({...g, phase:"bid", bidIdx:0, bids:[]}));
+
+  const confirmBid = (al, ability) => {
+    setGame(g => {
+      const pl = g.players[g.bidIdx];
+      const nb = [...g.bids, {pid:pl.id, al, ability:ability||null}];
+      return {...g, bids:nb, bidIdx:g.bidIdx+1, phase:"handoff"};
+    });
+  };
+
+  const hoNext = () => {
+    setGame(g => {
+      if (g.bidIdx >= g.pc) return resolveBids(g);
+      return {...g, phase:"bid"};
+    });
+  };
+
+  const nextRound = () => {
+    setGame(g => {
+      // End game if last round reached
+      if (g.round >= MAX_ROUNDS) return {...g, phase:"result"};
+
+      // Safety guard: if deck has fewer cards than needed, end game early
+      if (g.deck.length < CARDS_PER_ROUND) return {...g, phase:"result"};
+
+      const newDeck  = [...g.deck];
+      const market   = newDeck.splice(0, CARDS_PER_ROUND);
+      // Accumulate past market into revealedCards
+      const revealedCards = [...g.revealedCards, ...g.market];
+      const np = g.players.map(p => ({...p, coins:p.coins+1}));
+      return {
+        ...g,
+        players: np,
+        round:   g.round + 1,
+        market,
+        deck:    newDeck,
+        dummy:   g.pc===2 ? mkDummy() : null,
+        phase:   "market",
+        bids:    [], bidIdx:0, reveal:null,
+        revealedCards,
+      };
+    });
+  };
+
+  const quitResult = () => {
+    setShowQ(false);
+    setEarly(game?.round ?? 1);
+    setGame(g => ({...g, phase:"result"}));
+  };
+
+  const hdrProps = {
+    isOn:au.isOn, onToggleBgm:au.toggle,
+    onRules:()=>setShowRules(true),
+    onQuit:()=>setShowQ(true),
+  };
+
+  return(<>
+    <style>{css}</style>
+    <AmbientBg/>
+    <div className="app">
+      {scr==="title"  &&<TitleScr onStart={()=>setScr("setup")} onRules={()=>setScr("rules")} isOn={au.isOn} onToggleBgm={au.toggle}/>}
+      {scr==="rules"  &&<RulesScr onBack={goTitle}/>}
+      {scr==="setup"  &&<SetupScr onStart={startGame} onBack={goTitle}/>}
+      {scr==="game"&&game&&<>
+        {game.phase==="market"  &&<MarketScr  game={game} onBid={startBid} {...hdrProps}/>}
+        {game.phase==="bid"     &&<BidScr     game={game} player={game.players[game.bidIdx]} onConfirm={confirmBid} sfx={au.sfx} {...hdrProps} showExit={false}/>}
+        {game.phase==="handoff" &&<HandoffScr game={game} nextName={game.bidIdx<game.pc?game.players[game.bidIdx].name:null} isLast={game.bidIdx>=game.pc} onNext={hoNext} {...hdrProps} showExit={false}/>}
+        {game.phase==="reveal"  &&<RevealScr  game={game} onNext={nextRound} sfx={au.sfx} {...hdrProps}/>}
+        {game.phase==="result"  &&<ResultScr  game={game} onRematch={rematch} onSetup={()=>{setGame(null);setScr("setup");}} onTitle={goTitle} early={!!early} eRound={early}/>}
+      </>}
+    </div>
+    {showQ      && <QuitModal onCancel={()=>setShowQ(false)} onQuit={goTitle} onResult={quitResult}/>}
+    {showRules  && <RulesSheet onClose={()=>setShowRules(false)}/>}
+  </>);
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<App />);
+
+  </script>
+</body>
+</html>
